@@ -1,6 +1,6 @@
 # 🪐 CodexManager
 
-CodexManager is a lightweight, local daemon and dashboard designed to manage multiple Codex accounts and automatically hot-swap them before rate limits are hit. It keeps your AI coding flow uninterrupted by rotating credentials dynamically under the hood.
+CodexManager is a lightweight, local daemon and dashboard designed to manage multiple accounts for the **Desktop Codex application** and automatically hot-swap them before rate limits are hit. It keeps your AI coding flow uninterrupted by rotating credentials dynamically under the hood.
 
 ![Codex Manager Dashboard](screenshot.png)
 
