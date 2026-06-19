@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Codex Manager</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=6">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🪐</text></svg>">
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <h1 class="app-title">Codex Manager</h1>
+      <div class="header-actions">
+        <button id="btn-add-account" class="btn btn-add-account" title="Add an account safely (opens a login — your current session stays signed in)">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
+        <button id="btn-sync" class="btn btn-sync" title="Sync & refresh all account limits">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+        </button>
+        <button id="btn-settings" class="btn btn-settings" title="Settings">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="dashboard-content">
+      <!-- Active Account Section -->
+      <div class="section-label">Active</div>
+      <div id="active-account-container">
+        <div class="card active-card loading-card">
+          <div class="loading-text">Loading active session...</div>
+        </div>
+      </div>
+
+      <!-- Other Saved Accounts Section -->
+      <div id="other-accounts-section" style="display: none;">
+        <div class="section-label" style="margin-top: 32px;">Saved</div>
+        <div id="accounts-list" class="accounts-list"></div>
+      </div>
+    </main>
+
+    <footer class="app-footer">
+      <button id="theme-toggle" class="btn btn-theme" title="Toggle dark/light theme">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="icon-sun"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="icon-moon" style="display:none;"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+      </button>
+    </footer>
+  </div>
+
+  <!-- Custom Right-Click Context Menu -->
+  <div id="custom-context-menu" class="context-menu">
+    <div class="context-menu-item" id="context-menu-delete">
+      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="context-menu-icon"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+      <span>Delete Account</span>
+    </div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div id="settings-overlay" class="modal-overlay">
+    <div class="modal" role="dialog" aria-label="Settings">
+      <div class="modal-header">
+        <h2 class="modal-title">Settings</h2>
+        <button id="settings-close" class="btn btn-modal-close" title="Close">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m18 6-12 12M6 6l12 12"/></svg>
+        </button>
+      </div>
+
+      <div class="modal-body">
+        <div class="setting-row">
+          <div class="setting-text">
+            <div class="setting-label">Preemptive rotation</div>
+            <div class="setting-desc">Proxy avoids accounts past the threshold and rotates to one with headroom.</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="set-autoswap"><span class="slider"></span></label>
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-text">
+            <div class="setting-label">Rotation threshold</div>
+            <div class="setting-desc">Treat an account as "near limit" when its busiest window reaches this percent.</div>
+          </div>
+          <div class="setting-input-wrap">
+            <input type="number" id="set-threshold" min="50" max="100" step="1" class="num-input">
+            <span class="input-suffix">%</span>
+          </div>
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-text">
+            <div class="setting-label">Manual-swap reload</div>
+            <div class="setting-desc">How an explicit swap is applied. Note: a manual swap is a real account switch and signs you out of the current one.</div>
+          </div>
+          <select id="set-reloadmode" class="select-input">
+            <option value="new-sessions">New sessions only (no restart)</option>
+            <option value="soft">Soft (bounce backend + reload)</option>
+            <option value="relaunch">Relaunch Codex (most reliable)</option>
+          </select>
+        </div>
+
+        <div class="setting-divider" style="display: none !important;"></div>
+
+        <div class="setting-row" style="display: none !important;">
+          <div class="setting-text">
+            <div class="setting-label">Proxy load-balancer <span class="badge-exp">recommended</span></div>
+            <div class="setting-desc">Seamless multi-account rotation via the CLI with no restarts and no session conflicts. Point Codex at it with the snippet below.</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="set-proxy"><span class="slider"></span></label>
+        </div>
+        <div id="proxy-detail" class="proxy-detail" style="display: none !important;">
+          <div class="proxy-status" id="proxy-status-text">Proxy stopped</div>
+          <pre id="proxy-snippet" class="code-snippet"></pre>
+          <button id="btn-copy-snippet" class="btn-text">Copy config snippet</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification Banner -->
+  <div id="toast" class="toast">
+    <div id="toast-icon-container" class="toast-icon-container"></div>
+    <span id="toast-message" class="toast-message">Action completed</span>
+  </div>
+
+  <script src="client.js?v=6"></script>
+</body>
+</html>
