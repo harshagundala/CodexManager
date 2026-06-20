@@ -1,3 +1,6 @@
+# Local Claude Code state
+.claude/
+
 # Dependency directories
 node_modules/
 

@@ -11,10 +11,14 @@ const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn, exec } = require('child_process');
+const { spawn, exec, execSync } = require('child_process');
 
 const codex = require('./lib/codex');
 const reload = require('./lib/reload');
+const { getAppServer } = require('./lib/appserver');
+
+// Version string we report to the app-server in the `initialize` handshake.
+const APPSERVER_CLIENT_VERSION = '0.1.0';
 
 const {
   AUTH_PATH,
@@ -138,30 +142,198 @@ function getActiveGoals() {
   });
 }
 
-function resumeGoalsInDb() {
+// Thread IDs of goals the app parked because the account ran out of quota/budget,
+// excluding any the user has disabled. These are the goals safe to auto-resume: the
+// desktop app will not restart them itself, so resuming them can't race the app for a
+// background thread. We do NOT touch 'paused' (user paused) or 'blocked' (needs input).
+function getResumableThreadIds() {
   return new Promise((resolve) => {
     const goalsDb = path.join(os.homedir(), '.codex', 'goals_1.sqlite');
-    if (!fs.existsSync(goalsDb)) {
-      return resolve();
-    }
-    const disabledThreads = readJson(DISABLED_THREADS_PATH, []);
-    let cmd;
-    if (disabledThreads.length > 0) {
-      const ids = disabledThreads.map(id => `'${id}'`).join(',');
-      cmd = `sqlite3 "${goalsDb}" "UPDATE thread_goals SET status = 'active' WHERE status = 'usage_limited' AND thread_id NOT IN (${ids});"`;
-    } else {
-      cmd = `sqlite3 "${goalsDb}" "UPDATE thread_goals SET status = 'active' WHERE status = 'usage_limited';"`;
-    }
-    exec(cmd, (err, stdout, stderr) => {
-      if (err) {
-        console.error('[auto-swap] failed to resume goals in SQLite:', err.message);
-      } else {
-        console.log('[auto-swap] auto-resumed usage-limited goals in database');
+    if (!fs.existsSync(goalsDb)) return resolve([]);
+    const cmd = `sqlite3 -json "${goalsDb}" "SELECT thread_id FROM thread_goals WHERE status IN ('usage_limited','budget_limited');"`;
+    exec(cmd, (err, stdout) => {
+      if (err || !stdout) return resolve([]);
+      try {
+        const rows = JSON.parse(stdout.trim());
+        const disabled = new Set(readJson(DISABLED_THREADS_PATH, []));
+        resolve(rows.map(r => r.thread_id).filter(id => !disabled.has(id)));
+      } catch (e) {
+        resolve([]);
       }
-      resolve();
     });
   });
 }
+
+// Every goal that a swap would interrupt and must be resumed afterward: anything
+// actively running OR parked for quota/budget. A *preemptive* swap (at the % threshold)
+// interrupts goals while they're still 'active' — if we only resumed usage_limited ones
+// they'd be stranded (running in the now-killed app-server, never resumed). We exclude
+// 'paused' (user paused), 'blocked' (needs user input), 'complete', and disabled threads.
+function getActiveAndLimitedThreadIds() {
+  return new Promise((resolve) => {
+    const goalsDb = path.join(os.homedir(), '.codex', 'goals_1.sqlite');
+    if (!fs.existsSync(goalsDb)) return resolve([]);
+    const cmd = `sqlite3 -json "${goalsDb}" "SELECT thread_id FROM thread_goals WHERE status IN ('active','usage_limited','budget_limited');"`;
+    exec(cmd, (err, stdout) => {
+      if (err || !stdout) return resolve([]);
+      try {
+        const rows = JSON.parse(stdout.trim());
+        const disabled = new Set(readJson(DISABLED_THREADS_PATH, []));
+        resolve(rows.map(r => r.thread_id).filter(id => !disabled.has(id)));
+      } catch (e) {
+        resolve([]);
+      }
+    });
+  });
+}
+
+// mtimes (ms) of session rollout files touched in the last ~2 min — i.e. threads/sub-
+// agents that have produced output recently. Used to detect when everything is quiescent.
+function recentRolloutMtimes() {
+  try {
+    const dir = path.join(os.homedir(), '.codex', 'sessions');
+    if (!fs.existsSync(dir)) return [];
+    const out = execSync(`find "${dir}" -name '*.jsonl' -mmin -2 2>/dev/null`, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    return out.trim().split('\n').filter(Boolean).map((p) => { try { return fs.statSync(p).mtimeMs; } catch { return 0; } });
+  } catch (e) {
+    return [];
+  }
+}
+
+// Wait until NO rollout (any thread or sub-agent) has been written for `quietMs`, or until
+// `maxMs` elapses. This is the cross-cutting guard so the swap's relaunch pkill doesn't
+// land in the middle of an in-flight turn (goal OR sub-agent) and lose its uncommitted work.
+function waitForQuiescence({ maxMs = 45000, quietMs = 3500 } = {}) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + maxMs;
+    const tick = () => {
+      const now = Date.now();
+      const mtimes = recentRolloutMtimes();
+      const mostRecent = mtimes.length ? Math.max(...mtimes) : 0;
+      if (now - mostRecent >= quietMs) return resolve({ quiet: true, waitedMs: maxMs - (deadline - now) });
+      if (now >= deadline) return resolve({ quiet: false, waitedMs: maxMs });
+      setTimeout(tick, 1000);
+    };
+    tick();
+  });
+}
+
+// Drain before a disruptive (relaunch/soft) reload: gracefully pause the goals we drive
+// so their CURRENT turns finish + commit, then wait for global quiescence (covers sub-
+// agents and desktop-run goals we can't pause by RPC). After this, the relaunch pkill
+// only ever lands between turns, so resume continues exactly where it left off with no
+// lost/redone turn. Best-effort for continuously-busy sub-agents (bounded by maxMs).
+async function drainBeforeSwap() {
+  try {
+    await appServer().pauseManaged();
+  } catch (e) {
+    console.error('[drain] pauseManaged error:', e.message);
+  }
+  const r = await waitForQuiescence({ maxMs: 45000, quietMs: 3500 });
+  console.log(`[drain] quiescence before swap: ${r.quiet ? 'reached' : 'TIMEOUT (some turn may still be in-flight)'} after ~${Math.round(r.waitedMs / 1000)}s`);
+  return r;
+}
+
+// Thread ids are Codex UUIDs (hex + hyphens). Validate before ever interpolating one
+// into a sqlite3 shell command, so a malformed/tampered id can't inject shell or SQL.
+function isValidThreadId(id) {
+  return typeof id === 'string' && /^[a-fA-F0-9-]{8,64}$/.test(id);
+}
+
+// Current goal status for a thread, or null if it has no goal row.
+function getGoalStatus(threadId) {
+  return new Promise((resolve) => {
+    if (!isValidThreadId(threadId)) return resolve(null);
+    const goalsDb = path.join(os.homedir(), '.codex', 'goals_1.sqlite');
+    if (!fs.existsSync(goalsDb)) return resolve(null);
+    const cmd = `sqlite3 -json "${goalsDb}" "SELECT status FROM thread_goals WHERE thread_id = '${threadId}' LIMIT 1;"`;
+    exec(cmd, (err, stdout) => {
+      if (err || !stdout) return resolve(null);
+      try {
+        const rows = JSON.parse(stdout.trim());
+        resolve(rows[0] ? rows[0].status : null);
+      } catch (e) {
+        resolve(null);
+      }
+    });
+  });
+}
+
+// rollout_path + cwd for a thread, used to populate thread/resume params. Pulled from
+// state_5.sqlite (the desktop app's own thread store).
+function getThreadMeta(threadId) {
+  return new Promise((resolve) => {
+    if (!isValidThreadId(threadId)) return resolve(null);
+    const stateDb = path.join(os.homedir(), '.codex', 'state_5.sqlite');
+    if (!fs.existsSync(stateDb)) return resolve(null);
+    const cmd = `sqlite3 -json "${stateDb}" "SELECT rollout_path, cwd FROM threads WHERE id = '${threadId}' LIMIT 1;"`;
+    exec(cmd, (err, stdout) => {
+      if (err || !stdout) return resolve(null);
+      try {
+        const rows = JSON.parse(stdout.trim());
+        if (rows[0]) return resolve({ rolloutPath: rows[0].rollout_path, cwd: rows[0].cwd });
+      } catch (e) {
+        /* fall through */
+      }
+      resolve(null);
+    });
+  });
+}
+
+function appServer() {
+  return getAppServer({
+    binary: resolveCodexBinary(),
+    version: APPSERVER_CLIENT_VERSION,
+    getThreadMeta,
+  });
+}
+
+// Resume + activate a batch of threads through a codex app-server WE control. The
+// app-server reads ~/.codex/auth.json at startup, so we (re)spawn it under `authInfo`
+// (the account currently in auth.json) first — that's what makes resumed turns run on
+// the right, in-quota account instead of failing with AuthorizationRequired.
+async function resumeThreadsViaAppServer(threadIds, { authInfo } = {}) {
+  if (!threadIds || threadIds.length === 0) return [];
+  const as = appServer();
+  let info = authInfo;
+  if (!info) {
+    const a = readJson(AUTH_PATH, null);
+    info = a ? extractAccountInfo(a) : null;
+  }
+  try {
+    await as.ensureFreshFor(info);
+  } catch (e) {
+    console.error('[resume] could not start app-server:', e.message);
+    return [];
+  }
+  const results = await as.resumeMany(threadIds);
+  const ok = results.filter(r => r.ok).length;
+  console.log(`[resume] app-server now running ${ok}/${threadIds.length} goal(s): ${threadIds.join(', ')}`);
+  return results;
+}
+
+// On daemon startup, re-attach to goals we were driving before a restart (the app-server
+// dies with the daemon, so its turns stopped). Drops threads that are gone, complete, or
+// user-disabled.
+async function reattachManagedGoals() {
+  const as = appServer();
+  if (as.listManaged().length === 0) return;
+  const activeAuth = readJson(AUTH_PATH, null);
+  const activeInfo = activeAuth ? extractAccountInfo(activeAuth) : null;
+  try {
+    await as.ensureFreshFor(activeInfo);
+  } catch (e) {
+    console.error('[resume] could not start app-server for reattach:', e.message);
+    return;
+  }
+  await as.reattachPersisted(async (threadId) => {
+    const disabled = readJson(DISABLED_THREADS_PATH, []);
+    if (disabled.includes(threadId)) return false;
+    const status = await getGoalStatus(threadId);
+    return status && status !== 'complete';
+  });
+}
+
 
 // --------------------------------------------------------------------------
 // Registry helpers
@@ -276,8 +448,16 @@ async function swapTo(nickname, { reloadMode } = {}) {
     }
   }
 
-  // Resume any usage-limited goals in the SQLite database before writing new auth.json
-  await resumeGoalsInDb();
+  // Snapshot EVERY goal this swap will interrupt (active + quota/budget-paused) BEFORE
+  // we touch anything, so we can resume them all on the incoming account. Capturing
+  // 'active' too prevents stranding goals when this is a preemptive swap.
+  const threadsToResume = await getActiveAndLimitedThreadIds();
+
+  // DRAIN: pause the goals we drive so their current turns commit, then wait for global
+  // quiescence (sub-agents included) — so the relaunch pkill below never interrupts an
+  // in-flight turn. This is what makes resume continue EXACTLY where it left off with
+  // zero redone turns.
+  await drainBeforeSwap();
 
   if (!writeJsonAtomic(AUTH_PATH, account.authData)) {
     throw new Error('failed to write ~/.codex/auth.json');
@@ -286,11 +466,21 @@ async function swapTo(nickname, { reloadMode } = {}) {
   const mode = reloadMode || settings.reloadMode || 'soft';
   let reloadResult = 'auth.json written';
   try {
-    reloadResult = await reload.performSwapReload(mode);
+    reloadResult = await reload.performSwapReload(mode, { force: true });
   } catch (e) {
     reloadResult = `auth.json written; reload error: ${e.message}`;
   }
   console.log(`[swap] -> "${nickname}" (${account.email}) [${mode}]: ${reloadResult}`);
+
+  // Resume every interrupted goal on the NEW account via an app-server we control. This
+  // re-activates each goal (authentically, via thread/goal/set) and starts it running
+  // again from its last committed turn — no green-but-idle goals, no stranded goals.
+  if (threadsToResume.length > 0) {
+    const info = extractAccountInfo(account.authData);
+    resumeThreadsViaAppServer(threadsToResume, { authInfo: info })
+      .catch((e) => console.error('[swap] resume error:', e.message));
+  }
+
   return { nickname, email: account.email, reload: reloadResult, mode };
 }
 
@@ -322,17 +512,14 @@ async function checkAndPerformAutoSwap() {
   const activeLimited = activeAccount.usage?.rate_limit?.limit_reached || activeUsed >= settings.swapThreshold;
 
   if (!activeLimited) {
-    const goals = await getActiveGoals();
-    const hasPausedGoals = goals.some(g => g.status === 'usage_limited' && !g.disabled);
-    if (hasPausedGoals) {
-      console.log(`[auto-swap] Active account "${activeNickname}" regained quota. Resuming paused goals without swapping.`);
-      await resumeGoalsInDb();
-      try {
-        const reloadResult = await reload.performSwapReload('soft');
-        console.log(`[auto-swap] Resumed goals on active "${activeNickname}" [soft]: ${reloadResult}`);
-      } catch (e) {
-        console.error('[auto-swap] soft reload failed:', e.message);
-      }
+    // The active account has quota. If it has goals the app parked for quota/budget,
+    // resume them in place (no swap needed) — the app-server already holds this
+    // account's auth, so we just resume + activate.
+    const threadsToResume = await getResumableThreadIds();
+    if (threadsToResume.length > 0) {
+      console.log(`[auto-swap] Active account "${activeNickname}" has quota; resuming ${threadsToResume.length} paused goal(s) without swapping.`);
+      resumeThreadsViaAppServer(threadsToResume, { authInfo: activeInfo })
+        .catch((e) => console.error('[auto-swap] resume error:', e.message));
     }
     return;
   }
@@ -354,8 +541,11 @@ async function checkAndPerformAutoSwap() {
   const target = candidates[0];
   console.log(`[auto-swap] Auto-swapping active session -> "${target.nick}" (${target.used}%)`);
   try {
-    // Perform the swap (using 'relaunch' reloadMode so the desktop app restarts and picks it up)
-    await swapTo(target.nick, { reloadMode: 'relaunch' });
+    // Use the configured reload mode (default 'soft'). We no longer force a full
+    // relaunch: parked goals are resumed by the app-server we control, so the heavy
+    // quit-and-relaunch (which also risks the desktop app re-running an open thread)
+    // is unnecessary.
+    await swapTo(target.nick);
   } catch (e) {
     console.error('[auto-swap] swap failed:', e.message);
   }
@@ -410,7 +600,9 @@ async function backgroundTick() {
 
   if (changed) writeJsonAtomic(REGISTRY_PATH, registry);
 
-  // Evaluate auto-swap (overwriting auth.json and relaunching Codex if needed)
+  // Evaluate auto-swap. This also resumes quota/budget-paused goals when the active
+  // account has headroom, so a dedicated periodic "heal" pass is no longer needed:
+  // the app-server keeps the goals it owns running and self-restarts if it dies.
   await checkAndPerformAutoSwap();
 }
 
@@ -785,6 +977,22 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { success: true, disabled });
     }
 
+    // POST /api/goals/force-resume {thread_ids?} — resume + run specific threads (or
+    // all quota/budget-paused ones) on the currently-active account, via the app-server.
+    if (method === 'POST' && pathname === '/api/goals/force-resume') {
+      const body = (await readBody(req)) || {};
+      let ids = Array.isArray(body.thread_ids) ? body.thread_ids.filter(isValidThreadId) : null;
+      if (!ids || ids.length === 0) ids = await getResumableThreadIds();
+      const results = await resumeThreadsViaAppServer(ids);
+      return sendJson(res, 200, { success: true, requested: ids, results });
+    }
+
+    // GET /api/appserver/status — what the app-server is currently driving.
+    if (method === 'GET' && pathname === '/api/appserver/status') {
+      const as = appServer();
+      return sendJson(res, 200, { initialized: !!as.initialized, alive: !!as.child, managed: as.listManaged() });
+    }
+
     // POST /api/register {nickname}
     if (method === 'POST' && pathname === '/api/register') {
       const body = await readBody(req);
@@ -1008,6 +1216,11 @@ if (require.main === module) {
     if (getSettings().proxyEnabled) {
       startProxy().catch((e) => console.error('[proxy] auto-start failed:', e.message));
     }
+    // Re-attach to any goals we were driving before a restart (the app-server dies
+    // with the daemon, so their turns stopped). Delay a few seconds to let things settle.
+    setTimeout(() => {
+      reattachManagedGoals().catch((e) => console.error('[resume] error in startup reattach:', e.message));
+    }, 3000);
   });
 }
 
